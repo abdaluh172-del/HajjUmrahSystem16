@@ -1,0 +1,1689 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Hajj &amp; Umrah Sentiment Analysis System</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  body{margin:0;}
+  ::-webkit-scrollbar{width:8px;height:8px;}
+  ::-webkit-scrollbar-thumb{background:#94a3b8;border-radius:8px;}
+</style>
+<script>
+  // Show a clear message instead of a silent blank page if a CDN file
+  // fails to load (blocked network, offline, ad-blocker, etc.)
+  function showFatalOverlay(msg) {
+    var root = document.getElementById('root');
+    if (!root) return;
+    root.innerHTML = '<div style="padding:40px;font-family:sans-serif;max-width:700px;margin:0 auto">' +
+      '<h2 style="color:#b91c1c">Something went wrong</h2>' +
+      '<pre style="white-space:pre-wrap;font-family:monospace;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:12px;color:#b91c1c">' + msg + '</pre>' +
+      '<button onclick="location.reload()" style="margin-top:12px;background:#0f766e;color:#fff;border:0;padding:10px 16px;border-radius:8px;cursor:pointer">Reload page</button></div>';
+  }
+  window.addEventListener('error', function (e) {
+    var isResource = e.target && e.target.tagName === 'SCRIPT';
+    if (isResource) {
+      showFatalOverlay('Failed to load: ' + (e.target.src || 'a required file') +
+        '\n\nThis page needs internet access to load React/Chart.js from a CDN. ' +
+        'Check your internet connection, disable any ad-blocker/VPN restriction for this page, then refresh (Ctrl+F5).');
+    } else {
+      var msg = 'JavaScript error: ' + e.message + '\n' + (e.error && e.error.stack || '');
+      console.error(msg);
+      // If the error happened before React ever mounted (e.g. a syntax/parse error
+      // in the Babel-transpiled script), the root is still empty — show it there
+      // instead of leaving a silent white page. Once mounted, React's own
+      // ErrorBoundary (below) handles rendering errors, so we only overlay here
+      // for pre-mount failures.
+      if (window.__appMounted !== true) { showFatalOverlay(msg); }
+    }
+  }, true);
+  window.addEventListener('unhandledrejection', function (e) {
+    var msg = 'Unhandled promise rejection: ' + (e.reason && (e.reason.stack || e.reason.message || e.reason));
+    console.error(msg);
+    if (window.__appMounted !== true) { showFatalOverlay(msg); }
+  });
+</script>
+</head>
+<body>
+<div id="root"><div style="padding:40px;font-family:sans-serif;color:#666">Loading…</div></div>
+
+<script type="text/babel" data-presets="react">
+console.log("HajjUmrahSystem build: v12-real-reviews-external-sources");
+const { useState, useEffect, useMemo, useRef } = React;
+
+/* ============== API BASE ============== */
+const API = window.location.origin + "/api";
+
+// Every API call goes through this wrapper: if the server doesn't respond
+// within 8 seconds, the request is aborted and rejected instead of hanging
+// the UI forever. Pages catch this and fall back to an empty/error state.
+function apiFetch(url, options) {
+  const controller = new AbortController();
+  // 30s instead of 8s: free hosting (e.g. Render) can take ~30s to wake from sleep,
+  // and 8s made the very first signup/login abort with a false "backend offline".
+  const timer = setTimeout(() => controller.abort(), 30000);
+  const opts = Object.assign({}, options, { signal: controller.signal });
+  // Attach the auth token (set on admin/user login) so admin-only endpoints work.
+  if (window.__authToken) {
+    opts.headers = Object.assign({}, opts.headers, { Authorization: "Bearer " + window.__authToken });
+  }
+  return fetch(url, opts).finally(() => clearTimeout(timer));
+}
+
+// Helper for reads that should show a loading/error state (Reports, Users list).
+// Unlike apiFetch on its own, this rejects on a non-OK response so a 404/500 HTML
+// error page from Flask doesn't silently break r.json() and leave the page stuck
+// on a blank/empty screen forever. (Login/signup/add-user intentionally keep using
+// apiFetch directly, since they need to read the JSON body even on error responses.)
+function apiFetchJson(url) {
+  return apiFetch(url).then((res) => {
+    if (!res.ok) {
+      const err = new Error("Request failed: " + res.status + " " + res.url);
+      err.status = res.status;
+      throw err;
+    }
+    return res.json();
+  });
+}
+
+/* ============== SESSION PERSISTENCE ============== */
+// Logged-in sessions (admin / registered users) are saved in the browser's
+// localStorage, so a refresh or reopening the site keeps you signed in.
+// The saved session expires client-side after 12 hours — the same lifetime
+// as the server-side token — and is cleared on logout. Guests are never saved.
+const AUTH_KEY = "hus_auth";
+const AUTH_MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12h, matches the backend token
+
+function saveSession(user, token) {
+  try {
+    if (!token || !user || user.guest) return; // only real accounts are remembered
+    localStorage.setItem(AUTH_KEY, JSON.stringify({ user, token, ts: Date.now() }));
+  } catch (e) { /* private mode / storage disabled — just skip remembering */ }
+}
+function loadSession() {
+  try {
+    const raw = localStorage.getItem(AUTH_KEY);
+    if (!raw) return null;
+    const s = JSON.parse(raw);
+    if (!s || !s.token || !s.user || Date.now() - (s.ts || 0) > AUTH_MAX_AGE_MS) {
+      localStorage.removeItem(AUTH_KEY);
+      return null;
+    }
+    return s;
+  } catch (e) { return null; }
+}
+function clearSession() {
+  try { localStorage.removeItem(AUTH_KEY); } catch (e) {}
+}
+
+/* ============== COMMENT TRANSLATION (Settings -> Comments Language) ============== */
+// EVERY signed-in account (admin AND regular users) can pick a display
+// language for comments in Settings — the choice is personal per account,
+// saved on the account's row in the database and restored on every login:
+//   "original" (default) -> comments are shown exactly as written
+//   "ar" / "en"          -> every displayed comment is auto-translated
+// Translation runs in the browser through Google's free translate endpoint,
+// results are cached in memory, and on any failure the ORIGINAL text is shown
+// — so nothing in the database is ever modified and nothing can break.
+const COMMENTS_LANG_KEY = "hus_comments_lang";
+const _trCache = {};
+const hasArabic = (s) => /[\u0600-\u06FF]/.test(s || "");
+function needsTranslation(text, target) {
+  if (!text) return false;
+  if (target === "ar") return !hasArabic(text); // already Arabic -> keep as-is
+  if (target === "en") return hasArabic(text);  // already English/Latin -> keep
+  return false;
+}
+function translateText(text, target) {
+  const key = target + "||" + text;
+  if (_trCache[key]) return Promise.resolve(_trCache[key]);
+  const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=" +
+    target + "&dt=t&q=" + encodeURIComponent(text);
+  return fetch(url)
+    .then((r) => { if (!r.ok) throw new Error("translate failed"); return r.json(); })
+    .then((data) => {
+      const out = ((data && data[0]) || []).map((p) => (p && p[0]) || "").join("").trim();
+      if (!out) throw new Error("empty translation");
+      _trCache[key] = out;
+      return out;
+    });
+}
+// Returns { map: {commentId -> translatedText}, busy } for a list of comments.
+function useTranslatedTexts(items, target) {
+  const [map, setMap] = useState({});
+  const [busy, setBusy] = useState(false);
+  const depKey = JSON.stringify([target, (items || []).map((c) => [c.id, c.text])]);
+  useEffect(() => {
+    if (!target || target === "original" || !items || !items.length) { setMap({}); setBusy(false); return; }
+    const todo = items.filter((c) => needsTranslation(c.text, target));
+    if (!todo.length) { setMap({}); setBusy(false); return; }
+    let alive = true;
+    setBusy(true);
+    Promise.all(todo.map((c) =>
+      translateText(c.text, target).then((tr) => [c.id, tr]).catch(() => [c.id, c.text])
+    )).then((pairs) => {
+      if (!alive) return;
+      const m = {};
+      pairs.forEach(([id, tr]) => { m[id] = tr; });
+      setMap(m);
+      setBusy(false);
+    });
+    return () => { alive = false; };
+  }, [depKey]);
+  return { map, busy };
+}
+
+/* ============== ICONS (tiny inline SVG set, no external deps) ============== */
+const ICONS = {
+  dashboard: "M3 3h8v8H3V3Zm10 0h8v5h-8V3ZM3 13h8v8H3v-8Zm10-3h8v11h-8V10Z",
+  analyze: "M4 4h16v4H4V4Zm0 6h10v10H4V10Zm12 0h4v4h-4v-4Zm0 6h4v4h-4v-4Z",
+  comments: "M4 4h16v11H7l-3 3V4Z",
+  chart: "M4 20V10m6 10V4m6 16v-7m6 7V8",
+  settings: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm8-3a8 8 0 0 0-.2-1.8l2-1.6-2-3.4-2.4 1a8 8 0 0 0-3-1.8L14 2h-4l-.4 2.4a8 8 0 0 0-3 1.8l-2.4-1-2 3.4 2 1.6A8 8 0 0 0 4 12c0 .6.1 1.2.2 1.8l-2 1.6 2 3.4 2.4-1a8 8 0 0 0 3 1.8L10 22h4l.4-2.4a8 8 0 0 0 3-1.8l2.4 1 2-3.4-2-1.6c.1-.6.2-1.2.2-1.8Z",
+  sun: "M12 3v2m0 14v2M4.2 4.2l1.4 1.4m12.8 12.8 1.4 1.4M3 12h2m14 0h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z",
+  moon: "M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5Z",
+  globe: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm0 0c2.5 2.7 4 6.2 4 10s-1.5 7.3-4 10m0-20C9.5 4.7 8 8.2 8 12s1.5 7.3 4 10M2.5 9h19M2.5 15h19",
+  bell: "M6 8a6 6 0 1 1 12 0c0 5 2 6 2 6H4s2-1 2-6Zm4 10a2 2 0 0 0 4 0",
+  search: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Zm10 17-5.4-5.4",
+  trash: "M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13",
+  eye: "M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7Zm10 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z",
+  copy: "M9 9h11v11H9V9ZM4 4h11v11H4V4Z",
+  download: "M12 3v13m0 0-4-4m4 4 4-4M4 20h16",
+  x: "M6 6l12 12M18 6 6 18",
+  user: "M12 12a5 5 0 1 0 0-10 5 5 0 0 0 0 10Zm0 2c-5 0-9 2.5-9 6v2h18v-2c0-3.5-4-6-9-6Z",
+  logout: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4m6 14 5-5-5-5m5 5H9",
+  sparkles: "M12 2l1.8 5.2L19 9l-5.2 1.8L12 16l-1.8-5.2L5 9l5.2-1.8L12 2Z",
+  upload: "M12 16V4m0 0-4 4m4-4 4 4M4 20h16",
+  paste: "M9 3h6v4H9V3ZM6 7h12v14H6V7Z",
+  clear: "M6 6l12 12M18 6 6 18",
+  menu: "M4 6h16M4 12h16M4 18h16",
+  check: "M20 6 9 17l-5-5",
+  file: "M6 2h9l5 5v15H6V2Zm9 0v5h5",
+  users: "M9 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm-7 9c0-3.9 3.1-7 7-7s7 3.1 7 7M17 11a3.5 3.5 0 1 0 0-7m2 16c0-2.8-1.6-5.2-4-6.4",
+  edit: "M4 20h4l10-10-4-4L4 16v4Zm12.5-12.5 2.5 2.5",
+  clock: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Zm0-15v5l3.5 2",
+};
+function Icon({ name, size = 16, className = "" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+      strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <path d={ICONS[name] || ""} />
+    </svg>
+  );
+}
+function MosqueLogo({ size = 26, className = "" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className}>
+      <path d="M12 2C9 6 8 8 8 11a4 4 0 008 0c0-3-1-5-4-9z" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M4 21v-3a8 8 0 0116 0v3" stroke="currentColor" strokeWidth="1.4" />
+    </svg>
+  );
+}
+
+/* ============== I18N ============== */
+const T = {
+  ar: {
+    appName: "الحج والعمرة", appSub: "نظام تحليل مشاعر التعليقات",
+    welcomeBack: "مرحباً بعودتك", signInSub: "الرجاء تسجيل الدخول إلى حسابك",
+    loginHeadline: "تحليل ملاحظات الحجاج والمعتمرين لتحسين الخدمات وتعزيز تجربة الحج والعمرة.",
+    email: "البريد الإلكتروني", password: "كلمة المرور", signIn: "تسجيل الدخول",
+    dashboard: "لوحة التحكم", analyzeComment: "تحليل تعليق", comments: "التعليقات", settings: "الإعدادات",
+    analytics: "التحليلات", reports: "التقارير", users: "المستخدمون", profile: "الملف الشخصي",
+    logout: "تسجيل الخروج", totalComments: "إجمالي التعليقات", positive: "إيجابي", negative: "سلبي", neutral: "محايد",
+    ofTotal: "من الإجمالي", sentimentDistribution: "توزيع المشاعر", sentimentByCategory: "المشاعر حسب الفئة",
+    sentimentOverTime: "المشاعر عبر الزمن", recentComments: "أحدث التعليقات",
+    topKeywords: "أبرز الكلمات المفتاحية", enterComment: "أدخل التعليق",
+    writeComment: "اكتب أو الصق تعليق أحد الحجاج هنا (عربي أو إنجليزي)...", analyze: "تحليل", clear: "مسح",
+    analyzing: "جاري التحليل...", analysisResult: "نتيجة التحليل", confidenceScore: "درجة الثقة",
+    keywordsDetected: "الكلمات المفتاحية المكتشفة", noKeywords: "لم يتم اكتشاف كلمات مشاعر قوية.",
+    howItWorks: "كيف يعمل", step1: "أدخل التعليق", step1d: "اكتب أو الصق أي تعليق عن خدمات الحج والعمرة.",
+    step2: "تحليل الذكاء الاصطناعي", step2d: "يقوم النموذج بتحليل النص باستخدام TF-IDF و Naive Bayes.",
+    step3: "احصل على النتيجة", step3d: "شاهد نتائج المشاعر والتفاصيل فوراً.",
+    search: "ابحث في التعليقات...", allSentiments: "كل المشاعر", allCategories: "كل الفئات",
+    category: "الفئة", date: "التاريخ", sentiment: "الشعور", actions: "إجراءات", delete: "حذف", view: "عرض", edit: "تعديل", cancel: "إلغاء",
+    exportCsv: "تصدير CSV", showing: "عرض", of: "من", theme: "المظهر", light: "فاتح", dark: "داكن",
+    language: "اللغة", loading: "جاري التحميل...", connectedBackend: "متصل بالخادم الحقيقي",
+    backendOffline: "تعذر الاتصال بالخادم — إن كان على استضافة مجانية فقد يحتاج ~30 ثانية ليعمل، أعد المحاولة", close: "إغلاق",
+    generateReport: "إنشاء تقرير", print: "طباعة / حفظ PDF", reportSummary: "الملخص",
+    addUser: "إضافة مستخدم", name: "الاسم", role: "الصلاحية", admin: "مدير", manager: "مشرف", viewer: "مشاهد",
+    guest: "ضيف", user: "مستخدم", continueAsGuest: "المتابعة كضيف", or: "أو",
+    adminOnly: "هذه الصفحة متاحة للمدير فقط", adminOnlySub: "هذه الصفحة من أدوات الإدارة — سجّل الدخول بحساب الأدمن للوصول إليها.",
+    loginLogs: "سجل تسجيل الدخول", status: "الحالة", success: "نجاح", failed: "فشل", time: "الوقت",
+    searchLogs: "ابحث بالاسم أو البريد أو الحالة...", sortBy: "ترتيب حسب",
+    newestFirst: "الأحدث أولاً", oldestFirst: "الأقدم أولاً",
+    commentsLanguage: "لغة التعليقات", originalLang: "الأصلية",
+    commentsLanguageSub: "تُترجم جميع التعليقات المعروضة تلقائيًا إلى اللغة المختارة (تتطلب اتصالًا بالإنترنت).",
+    translating: "جاري ترجمة التعليقات...",
+    protectedAccount: "حساب أساسي محمي — لا يمكن حذفه أو تغيير صلاحيته",
+    guestBanner: "أنت تتصفح كضيف — يمكنك مشاهدة التعليقات فقط. أنشئ حسابًا لإضافة تعليق.",
+    guestWriteNote: "كضيف يمكنك التحليل والمشاهدة فقط — أنشئ حسابًا لحفظ تعليقك في النظام.",
+    // ---- v12: نظام المراجعات ----
+    reviews: "المراجعات", avgRating: "متوسط التقييم", ratedReviews: "مراجعة مقيّمة",
+    yourRating: "تقييمك", writeReview: "أضف مراجعتك", allRatings: "كل التقييمات",
+    allSources: "كل المصادر", sourceUser: "الموقع", sourceYoutube: "يوتيوب", sourceReddit: "ريدت", sourceX: "منصة X",
+    fromDate: "من تاريخ", toDate: "إلى تاريخ", like: "إعجاب", stars: "نجوم",
+    hiddenStatus: "مخفي", approvedStatus: "منشور", approve: "نشر", hideAction: "إخفاء",
+    edit: "تعديل", cancel: "إلغاء", saveEdit: "حفظ", allStatuses: "كل الحالات",
+    moderationHint: "أدوات الإشراف: نشر / إخفاء / تعديل / حذف",
+    insightsTitle: "ملخص الذكاء الاصطناعي", topProblems: "أكثر المشاكل ذكرًا", topStrengths: "أكثر المميزات ذكرًا",
+    noInsights: "لا توجد بيانات كافية بعد — أضف مراجعات ليظهر الملخص.",
+    externalSources: "المصادر الخارجية", fetchNow: "جلب الآن", lastRun: "آخر تحديث",
+    notConfigured: "غير مُفعّل (أضف مفاتيح API في إعدادات الاستضافة)", configuredOn: "مُفعّل",
+    autoHourly: "تحديث تلقائي كل", minutes: "دقيقة", noComments: "لا توجد مراجعات بعد — كن أول من يشارك تجربته!",
+    save: "حفظ التغييرات",
+    loginFailed: "بيانات الدخول غير صحيحة", noAccount: "ليس لديك حساب؟",
+    signUp: "إنشاء حساب", signUpSub: "أنشئ حسابك للوصول إلى النظام", createAccount: "إنشاء الحساب",
+    backToLogin: "الرجوع لتسجيل الدخول", forgotPassword: "نسيت كلمة المرور؟",
+    forgotSub: "أدخل بريدك الإلكتروني وسنرسل لك رابط إعادة التعيين", sendResetLink: "إرسال رابط الاستعادة",
+    servicesCat: "Services", crowdCat: "Crowd Management", transportCat: "Transportation",
+    foodCat: "Food", staffCat: "Staff Behavior", accomCat: "Accommodation", generalCat: "General",
+  },
+  en: {
+    appName: "Hajj & Umrah", appSub: "Sentiment Analysis System",
+    welcomeBack: "Welcome Back", signInSub: "Please sign in to your account",
+    loginHeadline: "Analyzing pilgrims' feedback to improve services and enhance the Hajj & Umrah experience.",
+    email: "Email Address", password: "Password", signIn: "Sign In",
+    dashboard: "Dashboard", analyzeComment: "Analyze Comment", comments: "Comments", settings: "Settings",
+    analytics: "Analytics", reports: "Reports", users: "Users", profile: "Profile",
+    logout: "Logout", totalComments: "Total Comments", positive: "Positive", negative: "Negative", neutral: "Neutral",
+    ofTotal: "of total", sentimentDistribution: "Sentiment Distribution", sentimentByCategory: "Sentiment by Category",
+    sentimentOverTime: "Sentiment Over Time", recentComments: "Recent Comments",
+    topKeywords: "Top Keywords", enterComment: "Enter Comment",
+    writeComment: "Write or paste a pilgrim comment here (Arabic or English)...", analyze: "Analyze", clear: "Clear",
+    analyzing: "Analyzing...", analysisResult: "Analysis Result", confidenceScore: "Confidence Score",
+    keywordsDetected: "Keywords Detected", noKeywords: "No strong sentiment keywords detected.",
+    howItWorks: "How it works", step1: "Enter Comment", step1d: "Type or paste any comment about Hajj & Umrah services.",
+    step2: "AI Analysis", step2d: "The model analyzes the text using TF-IDF and Naive Bayes.",
+    step3: "Get Result", step3d: "View sentiment results and detailed insights instantly.",
+    search: "Search comments...", allSentiments: "All Sentiments", allCategories: "All Categories",
+    category: "Category", date: "Date", sentiment: "Sentiment", actions: "Actions", delete: "Delete", view: "View", edit: "Edit", cancel: "Cancel",
+    exportCsv: "Export CSV", showing: "Showing", of: "of", theme: "Theme", light: "Light", dark: "Dark",
+    language: "Language", loading: "Loading...", connectedBackend: "Connected to live backend",
+    backendOffline: "Could not reach the server — free hosting may need ~30s to wake up, please retry", close: "Close",
+    generateReport: "Generate Report", print: "Print / Save PDF", reportSummary: "Summary",
+    addUser: "Add User", name: "Name", role: "Role", admin: "Admin", manager: "Manager", viewer: "Viewer",
+    guest: "Guest", user: "User", continueAsGuest: "Continue as Guest", or: "or",
+    adminOnly: "This page is for admins only", adminOnlySub: "This is an admin tool — sign in with the admin account to access it.",
+    loginLogs: "Login Logs", status: "Status", success: "Success", failed: "Failed", time: "Time",
+    searchLogs: "Search by name, email or status...", sortBy: "Sort by",
+    newestFirst: "Newest first", oldestFirst: "Oldest first",
+    commentsLanguage: "Comments Language", originalLang: "Original",
+    commentsLanguageSub: "All displayed comments are automatically translated to the selected language (requires internet).",
+    translating: "Translating comments...",
+    protectedAccount: "Protected primary account — cannot be deleted or demoted",
+    guestBanner: "You are browsing as a guest — view only. Create an account to add comments.",
+    guestWriteNote: "As a guest you can view and analyze only — create an account to save your comment.",
+    // ---- v12: reviews system ----
+    reviews: "Reviews", avgRating: "Average rating", ratedReviews: "rated reviews",
+    yourRating: "Your rating", writeReview: "Write your review", allRatings: "All ratings",
+    allSources: "All sources", sourceUser: "This site", sourceYoutube: "YouTube", sourceReddit: "Reddit", sourceX: "X",
+    fromDate: "From date", toDate: "To date", like: "Like", stars: "stars",
+    hiddenStatus: "Hidden", approvedStatus: "Published", approve: "Publish", hideAction: "Hide",
+    edit: "Edit", cancel: "Cancel", saveEdit: "Save", allStatuses: "All statuses",
+    moderationHint: "Moderation tools: publish / hide / edit / delete",
+    insightsTitle: "AI Summary", topProblems: "Most mentioned problems", topStrengths: "Most mentioned strengths",
+    noInsights: "Not enough data yet — add reviews to see the summary.",
+    externalSources: "External sources", fetchNow: "Fetch now", lastRun: "Last refresh",
+    notConfigured: "Not configured (add API keys in your hosting settings)", configuredOn: "Configured",
+    autoHourly: "Auto-refresh every", minutes: "min", noComments: "No reviews yet — be the first to share your experience!",
+    save: "Save Changes",
+    loginFailed: "Invalid login credentials", noAccount: "Don't have an account?",
+    signUp: "Sign up", signUpSub: "Create your account to access the system", createAccount: "Create Account",
+    backToLogin: "Back to login", forgotPassword: "Forgot Password?",
+    forgotSub: "Enter your email and we'll send you a reset link", sendResetLink: "Send Reset Link",
+    servicesCat: "Services", crowdCat: "Crowd Management", transportCat: "Transportation",
+    foodCat: "Food", staffCat: "Staff Behavior", accomCat: "Accommodation", generalCat: "General",
+  },
+};
+const CATS = ["servicesCat", "crowdCat", "transportCat", "foodCat", "staffCat", "accomCat", "generalCat"];
+const CAT_LABEL_TO_KEY = { Services: "servicesCat", "Crowd Management": "crowdCat", Transportation: "transportCat",
+  Food: "foodCat", "Staff Behavior": "staffCat", Accommodation: "accomCat", General: "generalCat" };
+const COLORS = { positive: "#059669", negative: "#e11d48", neutral: "#9ca3af" };
+
+/* ============== SMALL UI ============== */
+const Card = ({ children, className = "", dark }) => (
+  <div className={`rounded-2xl border shadow-sm ${dark ? "bg-slate-900 border-slate-800" : "bg-white border-gray-100"} ${className}`}>{children}</div>
+);
+const Badge = ({ s, t }) => {
+  const map = { positive: "bg-emerald-100 text-emerald-700", negative: "bg-rose-100 text-rose-700", neutral: "bg-gray-200 text-gray-600" };
+  return <span className={`px-2.5 py-1 rounded-full text-xs font-medium ${map[s]}`}>{t[s]}</span>;
+};
+const PILL = "px-3 py-2 rounded-xl text-sm border focus:outline-none focus:ring-2 focus:ring-emerald-500 w-full";
+
+/* ============== v12: STARS + SOURCE BADGE ============== */
+// Stars: read-only display (value only) or interactive picker (pass onChange).
+function Stars({ value = 0, onChange, size = 15 }) {
+  return (
+    <span className="inline-flex items-center gap-0.5" dir="ltr">
+      {[1, 2, 3, 4, 5].map((n) => (
+        <svg key={n} onClick={onChange ? () => onChange(n) : undefined}
+          width={size} height={size} viewBox="0 0 24 24"
+          className={onChange ? "cursor-pointer" : ""}
+          fill={n <= value ? "#f59e0b" : "none"} stroke={n <= value ? "#f59e0b" : "#9ca3af"} strokeWidth="1.6">
+          <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" />
+        </svg>
+      ))}
+    </span>
+  );
+}
+// Source badge: shows where a comment came from (this site / YouTube / Reddit / X).
+function SourceBadge({ source, t, dark }) {
+  const MAP = {
+    user: { label: t.sourceUser, cls: dark ? "bg-slate-800 text-gray-300" : "bg-gray-100 text-gray-600" },
+    youtube: { label: t.sourceYoutube, cls: "bg-red-100 text-red-700" },
+    reddit: { label: t.sourceReddit, cls: "bg-orange-100 text-orange-700" },
+    x: { label: t.sourceX, cls: dark ? "bg-slate-700 text-gray-200" : "bg-gray-200 text-gray-800" },
+  };
+  const m = MAP[source] || MAP.user;
+  return <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium ${m.cls}`}>{m.label}</span>;
+}
+
+/* ============== CHART.JS WRAPPER ============== */
+function ChartCanvas({ type, data, options, height = 220 }) {
+  const ref = useRef(null);
+  const chartRef = useRef(null);
+  useEffect(() => {
+    if (!ref.current) return;
+    chartRef.current = new Chart(ref.current.getContext("2d"), { type, data, options });
+    return () => {
+      // Destroy exactly once, then clear the ref — without this, the next
+      // effect run saw a stale (already-destroyed) chart instance and called
+      // destroy() on it a second time, which throws inside Chart.js.
+      if (chartRef.current) {
+        chartRef.current.destroy();
+        chartRef.current = null;
+      }
+    };
+  }, [type, JSON.stringify(data), JSON.stringify(options)]);
+  return <div style={{ height }}><canvas ref={ref}></canvas></div>;
+}
+
+/* ============== BACKEND STATUS BANNER ============== */
+function BackendBanner({ t, online }) {
+  return (
+    <div className={`text-xs px-3 py-2 rounded-lg mb-3 flex items-center gap-2 ${online ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"}`}>
+      <span className={`w-2 h-2 rounded-full ${online ? "bg-emerald-500" : "bg-rose-500"}`}></span>
+      {online ? t.connectedBackend : t.backendOffline}
+    </div>
+  );
+}
+
+/* ============== LOGIN ============== */
+function Login({ t, lang, setLang, dark, setDark, onLogin }) {
+  const [mode, setMode] = useState("login"); // login | signup | forgot
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+
+  const reset = () => { setError(""); setInfo(""); };
+
+  const submitLogin = async (e) => {
+    e.preventDefault(); reset(); setLoading(true);
+    try {
+      const r = await apiFetch(`${API}/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password: pw }) });
+      const data = await r.json();
+      if (!r.ok) { setError((lang === "ar" && data.error_ar) || data.error || t.loginFailed); setLoading(false); return; }
+      window.__authToken = data.token || null;
+      saveSession(data.user, data.token); // remember the admin/user for next visits
+      onLogin(data.user || data);
+    } catch { setError(t.backendOffline); }
+    setLoading(false);
+  };
+
+  const submitSignup = async (e) => {
+    e.preventDefault(); reset(); setLoading(true);
+    try {
+      const r = await apiFetch(`${API}/auth/signup`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, email, password: pw }) });
+      const data = await r.json();
+      if (!r.ok) { setError((lang === "ar" && data.error_ar) || data.error || t.loginFailed); setLoading(false); return; }
+      window.__authToken = data.token || null;
+      saveSession(data.user, data.token); // remember the new account for next visits
+      onLogin(data.user || data);
+    } catch { setError(t.backendOffline); }
+    setLoading(false);
+  };
+
+  const continueAsGuest = async () => {
+    reset(); setLoading(true);
+    window.__authToken = null;
+    try {
+      const r = await apiFetch(`${API}/auth/guest`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const data = await r.json();
+      onLogin((data && data.user) || { name: "Guest", role: "guest", guest: true });
+    } catch {
+      // Even if the backend is unreachable, let the guest into the read-only UI.
+      onLogin({ name: "Guest", role: "guest", guest: true });
+    }
+    setLoading(false);
+  };
+
+  const submitForgot = async (e) => {
+    e.preventDefault(); reset(); setLoading(true);
+    try {
+      const r = await apiFetch(`${API}/auth/forgot-password`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
+      const data = await r.json();
+      setInfo(data.message);
+    } catch { setError(t.backendOffline); }
+    setLoading(false);
+  };
+
+  return (
+    <div className={`min-h-screen flex items-center justify-center p-4 ${dark ? "bg-slate-950" : "bg-emerald-50"}`}>
+      <div className="absolute top-4 inset-x-4 flex justify-end gap-2 z-10">
+        <button onClick={() => setLang(lang === "ar" ? "en" : "ar")} className={`px-3 py-2 rounded-full text-sm font-medium shadow ${dark ? "bg-slate-800 text-gray-200" : "bg-white text-emerald-900"}`}>
+          <Icon name="globe" size={14} /> {lang === "ar" ? "EN" : "AR"}
+        </button>
+        <button onClick={() => setDark(!dark)} className={`w-9 h-9 flex items-center justify-center rounded-full shadow ${dark ? "bg-slate-800 text-amber-300" : "bg-white text-emerald-900"}`}>
+          <Icon name={dark ? "sun" : "moon"} size={16} />
+        </button>
+      </div>
+      <div className={`w-full max-w-4xl grid md:grid-cols-2 rounded-3xl overflow-hidden shadow-2xl ${dark ? "bg-slate-900" : "bg-white"}`}>
+        <div className="relative hidden md:flex flex-col justify-end p-8 text-white min-h-[520px]"
+          style={{ background: "linear-gradient(180deg, rgba(3,30,22,.55), rgba(3,20,15,.9)), url(https://images.unsplash.com/photo-1591604129939-f1efa4d9f7fa?q=80&w=1200&auto=format&fit=crop) center/cover" }}>
+          <svg width="52" height="52" viewBox="0 0 24 24" fill="none" className="mb-4 text-amber-300">
+            <path d="M12 2C9 6 8 8 8 11a4 4 0 008 0c0-3-1-5-4-9z" stroke="currentColor" strokeWidth="1.4" />
+            <path d="M4 21v-3a8 8 0 0116 0v3" stroke="currentColor" strokeWidth="1.4" />
+          </svg>
+          <h1 className="text-3xl font-bold mb-2">{t.appName}</h1>
+          <p className="text-white/70 text-sm mb-3">{t.appSub}</p>
+          <div className="h-px w-16 bg-amber-300/70 mb-3" />
+          <p className="text-white/80 text-sm leading-relaxed max-w-xs">{t.loginHeadline}</p>
+        </div>
+
+        {mode === "login" && (
+          <form onSubmit={submitLogin} className="p-8 md:p-10 flex flex-col justify-center">
+            <div className={`w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-4 ${dark ? "bg-slate-800" : "bg-emerald-50"}`}>
+              <Icon name="user" size={22} className={dark ? "text-emerald-300" : "text-emerald-700"} />
+            </div>
+            <h2 className={`font-bold text-center ${dark ? "text-white" : "text-gray-900"}`}>{t.welcomeBack}</h2>
+            <p className={`text-sm text-center mb-5 ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.signInSub}</p>
+            {error && <p className="text-rose-600 text-xs text-center mb-3">{error}</p>}
+            <input required type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder={t.email}
+              className={`${PILL} mb-3 ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`} />
+            <input required type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder={t.password}
+              className={`${PILL} mb-2 ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`} />
+            <div className="flex justify-end mb-4">
+              <button type="button" onClick={() => { setMode("forgot"); reset(); }} className="text-xs text-emerald-600 font-medium">{t.forgotPassword}</button>
+            </div>
+            <button disabled={loading} className="w-full bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl py-2.5 font-medium">
+              {loading ? "..." : t.signIn}
+            </button>
+            <div className="flex items-center gap-3 my-4">
+              <div className={`h-px flex-1 ${dark ? "bg-slate-700" : "bg-gray-200"}`} />
+              <span className={`text-xs ${dark ? "text-gray-500" : "text-gray-400"}`}>{t.or}</span>
+              <div className={`h-px flex-1 ${dark ? "bg-slate-700" : "bg-gray-200"}`} />
+            </div>
+            <button type="button" disabled={loading} onClick={continueAsGuest}
+              className={`w-full rounded-xl py-2.5 font-medium border flex items-center justify-center gap-2 ${dark ? "border-slate-700 text-gray-200 hover:bg-slate-800" : "border-gray-200 text-gray-700 hover:bg-gray-50"}`}>
+              <Icon name="user" size={14} /> {t.continueAsGuest}
+            </button>
+            <p className={`text-center text-sm mt-3 ${dark ? "text-gray-400" : "text-gray-500"}`}>
+              {t.noAccount} <button type="button" onClick={() => { setMode("signup"); reset(); }} className="text-emerald-600 font-medium">{t.signUp}</button>
+            </p>
+          </form>
+        )}
+
+        {mode === "signup" && (
+          <form onSubmit={submitSignup} className="p-8 md:p-10 flex flex-col justify-center">
+            <h2 className={`font-bold text-center ${dark ? "text-white" : "text-gray-900"}`}>{t.signUp}</h2>
+            <p className={`text-sm text-center mb-5 ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.signUpSub}</p>
+            {error && <p className="text-rose-600 text-xs text-center mb-3">{error}</p>}
+            <input required value={name} onChange={(e) => setName(e.target.value)} placeholder={t.name}
+              className={`${PILL} mb-3 ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`} />
+            <input required type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder={t.email}
+              className={`${PILL} mb-3 ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`} />
+            <input required type="password" minLength={6} value={pw} onChange={(e) => setPw(e.target.value)} placeholder={t.password}
+              className={`${PILL} mb-4 ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`} />
+            <button disabled={loading} className="w-full bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl py-2.5 font-medium">
+              {loading ? "..." : t.createAccount}
+            </button>
+            <p className={`text-center text-sm mt-4 ${dark ? "text-gray-400" : "text-gray-500"}`}>
+              <button type="button" onClick={() => { setMode("login"); reset(); }} className="text-emerald-600 font-medium">{t.backToLogin}</button>
+            </p>
+          </form>
+        )}
+
+        {mode === "forgot" && (
+          <form onSubmit={submitForgot} className="p-8 md:p-10 flex flex-col justify-center">
+            <h2 className={`font-bold text-center ${dark ? "text-white" : "text-gray-900"}`}>{t.forgotPassword}</h2>
+            <p className={`text-sm text-center mb-5 ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.forgotSub}</p>
+            {error && <p className="text-rose-600 text-xs text-center mb-3">{error}</p>}
+            {info && <p className="text-emerald-600 text-xs text-center mb-3">{info}</p>}
+            <input required type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder={t.email}
+              className={`${PILL} mb-4 ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`} />
+            <button disabled={loading} className="w-full bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl py-2.5 font-medium">
+              {loading ? "..." : t.sendResetLink}
+            </button>
+            <p className={`text-center text-sm mt-4 ${dark ? "text-gray-400" : "text-gray-500"}`}>
+              <button type="button" onClick={() => { setMode("login"); reset(); }} className="text-emerald-600 font-medium">{t.backToLogin}</button>
+            </p>
+          </form>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============== SIDEBAR + TOPBAR ============== */
+function Sidebar({ t, page, setPage, dark, lang, open, setOpen, onLogout, isAdmin }) {
+  // Admin-only pages: hidden entirely from regular users and guests.
+  const ADMIN_ONLY_PAGES = ["analytics", "loginLogs", "users"];
+  const items = [
+    ["dashboard", "dashboard"], ["analyzeComment", "analyze"], ["comments", "comments"],
+    ["analytics", "chart"], ["reports", "file"], ["loginLogs", "clock"], ["users", "users"],
+    ["profile", "user"], ["settings", "settings"],
+  ].filter(([key]) => !ADMIN_ONLY_PAGES.includes(key) || isAdmin);
+  return (
+    <div className={`${open ? "translate-x-0" : lang === "ar" ? "translate-x-full md:translate-x-0" : "-translate-x-full md:translate-x-0"}
+      fixed md:static z-40 top-0 bottom-0 ${lang === "ar" ? "right-0" : "left-0"} w-64 transition-transform p-4 flex flex-col justify-between
+      ${dark ? "bg-slate-950" : "bg-emerald-950"} text-white`}>
+      <div>
+        <div className="flex items-center gap-2 px-1 mb-8">
+          <MosqueLogo size={26} className="text-amber-300 shrink-0" />
+          <div>
+            <div className="font-bold leading-tight">{t.appName}</div>
+            <div className="text-[11px] text-emerald-200/70 leading-tight">{t.appSub}</div>
+          </div>
+        </div>
+        <nav className="space-y-1">
+          {items.map(([key, icon]) => (
+            <button key={key} onClick={() => { setPage(key); setOpen(false); }}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm ${page === key ? "bg-emerald-700" : "text-emerald-100/80 hover:bg-emerald-900/60"}`}>
+              <Icon name={icon} size={16} /> {t[key]}
+            </button>
+          ))}
+        </nav>
+      </div>
+      <button onClick={onLogout} className="flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm text-emerald-100/70 hover:bg-emerald-900/60">
+        <Icon name="logout" size={16} /> {t.logout}
+      </button>
+    </div>
+  );
+}
+function Topbar({ t, lang, setLang, dark, setDark, title, setOpen, user }) {
+  return (
+    <div className={`sticky top-0 z-20 flex items-center justify-between px-4 md:px-6 py-3.5 border-b ${dark ? "bg-slate-950/90 border-slate-800" : "bg-white/90 border-gray-100"}`}>
+      <div className="flex items-center gap-3">
+        <button className="md:hidden" onClick={() => setOpen((v) => !v)}><Icon name="menu" className={dark ? "text-gray-300" : "text-gray-600"} /></button>
+        <h1 className={`font-bold text-lg ${dark ? "text-white" : "text-gray-900"}`}>{title}</h1>
+      </div>
+      <div className="flex items-center gap-2">
+        <button onClick={() => setLang(lang === "ar" ? "en" : "ar")} className={`px-3 py-1.5 rounded-full text-xs border ${dark ? "border-slate-700 text-gray-200" : "border-gray-200 text-gray-700"}`}>
+          {lang === "ar" ? "English" : "العربية"}
+        </button>
+        <button onClick={() => setDark(!dark)} className={`w-9 h-9 flex items-center justify-center rounded-full border ${dark ? "border-slate-700 text-amber-300" : "border-gray-200 text-gray-600"}`}>
+          <Icon name={dark ? "sun" : "moon"} size={16} />
+        </button>
+        {user && (
+          <div className={`w-9 h-9 rounded-full flex items-center justify-center font-semibold text-sm ${dark ? "bg-emerald-800 text-emerald-100" : "bg-emerald-100 text-emerald-800"}`}>
+            {(user.name || "?").charAt(0).toUpperCase()}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============== DASHBOARD ============== */
+function Dashboard({ t, dark, online, lang, commentsLang }) {
+  const [stats, setStats] = useState(null);
+  const [recent, setRecent] = useState([]);
+  const [insights, setInsights] = useState(null); // v12: AI summary (top problems / strengths)
+  // Translate the "Recent Comments" panel to the language chosen in Settings.
+  const { map: trRecent } = useTranslatedTexts(recent.slice(0, 6), commentsLang);
+  useEffect(() => {
+    apiFetch(`${API}/dashboard/stats`).then((r) => r.json()).then(setStats).catch(() => setStats(null));
+    apiFetch(`${API}/comments?per_page=100&sort=date`).then((r) => r.json()).then((d) => setRecent(d.items || [])).catch(() => setRecent([]));
+    apiFetch(`${API}/insights`).then((r) => r.json()).then(setInsights).catch(() => setInsights(null));
+  }, [online]);
+
+  if (!stats) return <div className="p-6"><Card dark={dark} className="p-8 text-center"><BackendBanner t={t} online={online} /></Card></div>;
+
+  const pie = {
+    labels: [t.positive, t.negative, t.neutral],
+    datasets: [{ data: [stats.positive, stats.negative, stats.neutral], backgroundColor: [COLORS.positive, COLORS.negative, COLORS.neutral] }],
+  };
+  const catLabels = Object.keys(stats.by_category);
+  const bar = {
+    labels: catLabels.map((c) => t[CAT_LABEL_TO_KEY[c]] || c),
+    datasets: [
+      { label: t.positive, data: catLabels.map((c) => stats.by_category[c].positive || 0), backgroundColor: COLORS.positive },
+      { label: t.negative, data: catLabels.map((c) => stats.by_category[c].negative || 0), backgroundColor: COLORS.negative },
+    ],
+  };
+
+  const days = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 24 * 3600 * 1000);
+    const dayComments = recent.filter((c) => new Date(c.created_at).toDateString() === d.toDateString());
+    days.push({
+      label: d.toLocaleDateString(lang === "ar" ? "ar" : "en", { weekday: "short" }),
+      positive: dayComments.filter((c) => c.sentiment === "positive").length,
+      negative: dayComments.filter((c) => c.sentiment === "negative").length,
+    });
+  }
+  const trend = {
+    labels: days.map((d) => d.label),
+    datasets: [
+      { label: t.positive, data: days.map((d) => d.positive), borderColor: COLORS.positive, backgroundColor: COLORS.positive + "33", tension: 0.35, fill: true },
+      { label: t.negative, data: days.map((d) => d.negative), borderColor: COLORS.negative, backgroundColor: COLORS.negative + "22", tension: 0.35, fill: true },
+    ],
+  };
+
+  return (
+    <div className="p-4 md:p-6 space-y-5">
+      <BackendBanner t={t} online={online} />
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        {[[t.totalComments, stats.total, "#0369a1"], [t.positive, stats.positive, COLORS.positive],
+        [t.negative, stats.negative, COLORS.negative], [t.neutral, stats.neutral, COLORS.neutral]].map(([label, val, color]) => (
+          <Card dark={dark} className="p-4" key={label}>
+            <div className={`text-xs mb-1 ${dark ? "text-gray-400" : "text-gray-500"}`}>{label}</div>
+            <div className={`text-2xl font-bold ${dark ? "text-white" : "text-gray-900"}`} style={{ color }}>{val}</div>
+          </Card>
+        ))}
+      </div>
+      <div className="grid lg:grid-cols-3 gap-4">
+        <Card dark={dark} className="p-4 lg:col-span-1">
+          <div className={`font-semibold mb-2 ${dark ? "text-white" : "text-gray-900"}`}>{t.sentimentDistribution}</div>
+          <ChartCanvas type="doughnut" data={pie} options={{ maintainAspectRatio: false }} />
+        </Card>
+        <Card dark={dark} className="p-4 lg:col-span-2">
+          <div className={`font-semibold mb-2 ${dark ? "text-white" : "text-gray-900"}`}>{t.sentimentOverTime}</div>
+          <ChartCanvas type="line" data={trend} options={{ maintainAspectRatio: false }} />
+        </Card>
+      </div>
+      <div className="grid lg:grid-cols-2 gap-4">
+        <Card dark={dark} className="p-4">
+          <div className={`font-semibold mb-2 ${dark ? "text-white" : "text-gray-900"}`}>{t.sentimentByCategory}</div>
+          <ChartCanvas type="bar" data={bar} options={{ maintainAspectRatio: false, scales: { x: { stacked: false } } }} />
+        </Card>
+        <Card dark={dark} className="p-4">
+          <div className={`font-semibold mb-3 ${dark ? "text-white" : "text-gray-900"}`}>{t.recentComments}</div>
+          <div className="space-y-2 max-h-56 overflow-auto pr-1">
+            {recent.slice(0, 6).map((c) => (
+              <div key={c.id} className={`flex items-center justify-between gap-3 p-2.5 rounded-xl ${dark ? "bg-slate-800/60" : "bg-gray-50"}`}>
+                <div className={`text-xs truncate flex-1 ${dark ? "text-gray-300" : "text-gray-700"}`}>{trRecent[c.id] || c.text}</div>
+                <Badge s={c.sentiment} t={t} />
+              </div>
+            ))}
+            {!recent.length && <div className={`text-xs ${dark ? "text-gray-500" : "text-gray-400"}`}>—</div>}
+          </div>
+        </Card>
+      </div>
+      <Card dark={dark} className="p-4">
+        <div className={`font-semibold mb-3 ${dark ? "text-white" : "text-gray-900"}`}>{t.topKeywords}</div>
+        <div className="flex flex-wrap gap-2">
+          {stats.top_keywords.map(([w, n]) => (
+            <span key={w} className={`px-2.5 py-1 rounded-full text-xs ${dark ? "bg-slate-800 text-gray-200" : "bg-emerald-50 text-emerald-800"}`} style={{ fontSize: 10 + Math.min(n, 6) * 1.5 }}>{w}</span>
+          ))}
+        </div>
+      </Card>
+      {/* ---- v12: AI summary — most mentioned problems & strengths ---- */}
+      <Card dark={dark} className="p-4">
+        <div className={`font-semibold mb-3 flex items-center gap-2 ${dark ? "text-white" : "text-gray-900"}`}>
+          <Icon name="sparkles" size={16} className="text-emerald-600" /> {t.insightsTitle}
+        </div>
+        {insights && (insights.top_problems.length || insights.top_strengths.length) ? (
+          <div className="grid md:grid-cols-2 gap-4">
+            <div className={`p-3 rounded-xl ${dark ? "bg-rose-950/30" : "bg-rose-50"}`}>
+              <div className="text-xs font-semibold text-rose-600 mb-2">{t.topProblems}</div>
+              <div className="flex flex-wrap gap-1.5">
+                {insights.top_problems.map(([w, n]) => (
+                  <span key={w} className={`px-2.5 py-1 rounded-full text-[11px] ${dark ? "bg-rose-900/40 text-rose-300" : "bg-white text-rose-700 border border-rose-200"}`}>{w} <b>×{n}</b></span>
+                ))}
+                {!insights.top_problems.length && <span className={`text-[11px] ${dark ? "text-gray-500" : "text-gray-400"}`}>—</span>}
+              </div>
+            </div>
+            <div className={`p-3 rounded-xl ${dark ? "bg-emerald-950/30" : "bg-emerald-50"}`}>
+              <div className="text-xs font-semibold text-emerald-600 mb-2">{t.topStrengths}</div>
+              <div className="flex flex-wrap gap-1.5">
+                {insights.top_strengths.map(([w, n]) => (
+                  <span key={w} className={`px-2.5 py-1 rounded-full text-[11px] ${dark ? "bg-emerald-900/40 text-emerald-300" : "bg-white text-emerald-700 border border-emerald-200"}`}>{w} <b>×{n}</b></span>
+                ))}
+                {!insights.top_strengths.length && <span className={`text-[11px] ${dark ? "text-gray-500" : "text-gray-400"}`}>—</span>}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <p className={`text-xs ${dark ? "text-gray-500" : "text-gray-400"}`}>{t.noInsights}</p>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ============== ANALYZE ============== */
+function AnalyzeComment({ t, dark, online, canWrite, onAnalyzed }) {
+  const [text, setText] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [category, setCategory] = useState("General");
+  const [rating, setRating] = useState(0); // v12: optional 1..5 star rating saved with the review
+
+  const run = async () => {
+    if (!text.trim()) return;
+    setLoading(true); setResult(null);
+    try {
+      const r = await apiFetch(`${API}/analyze`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+      const data = await r.json();
+      setResult(data);
+      // Persist it as a real comment only for registered users / admin.
+      // Guests carry no token, and the backend rejects their writes anyway.
+      if (canWrite) {
+        apiFetch(`${API}/comments`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, category, rating: rating || null }) })
+          .then(() => onAnalyzed && onAnalyzed());
+      }
+    } catch { setResult({ error: true }); }
+    setLoading(false);
+  };
+  const emoji = result && !result.error ? (result.label === "positive" ? "😊" : result.label === "negative" ? "😠" : "😐") : null;
+
+  return (
+    <div className="p-4 md:p-6 grid lg:grid-cols-2 gap-5">
+      <div className="space-y-5">
+        <Card dark={dark} className="overflow-hidden">
+          <div className="relative p-6 text-white min-h-[130px] flex flex-col justify-center"
+            style={{ background: "linear-gradient(120deg, rgba(3,30,22,.7), rgba(3,20,15,.35)), url(https://images.unsplash.com/photo-1591604129939-f1efa4d9f7fa?q=80&w=1200&auto=format&fit=crop) center/cover" }}>
+            <h2 className="text-xl font-bold">{t.analyzeComment}</h2>
+            <p className="text-white/80 text-sm mt-1 max-w-md">{t.writeComment}</p>
+          </div>
+        </Card>
+        <Card dark={dark} className="p-5">
+          <BackendBanner t={t} online={online} />
+          <div className={`font-semibold mb-3 ${dark ? "text-white" : "text-gray-900"}`}>{t.enterComment}</div>
+          <textarea value={text} onChange={(e) => setText(e.target.value)} rows={7} placeholder={t.writeComment}
+            className={`w-full rounded-xl border p-3 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-emerald-500 ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`} />
+          <select value={category} onChange={(e) => setCategory(e.target.value)} className={`${PILL} mt-3 ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`}>
+            {CATS.map((c) => <option key={c} value={Object.keys(CAT_LABEL_TO_KEY).find((k) => CAT_LABEL_TO_KEY[k] === c) || c}>{t[c]}</option>)}
+          </select>
+          {canWrite && (
+            <div className="flex items-center gap-2 mt-3">
+              <span className={`text-xs ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.yourRating}:</span>
+              <Stars value={rating} onChange={setRating} size={20} />
+              {rating > 0 && <button onClick={() => setRating(0)} className={`text-[10px] underline ${dark ? "text-gray-500" : "text-gray-400"}`}>{t.clear}</button>}
+            </div>
+          )}
+          <div className="flex gap-2 mt-3">
+            <button onClick={run} className="flex items-center gap-1.5 bg-emerald-700 hover:bg-emerald-800 text-white px-4 py-2 rounded-xl text-sm font-medium">
+              <Icon name="sparkles" size={15} /> {loading ? t.analyzing : t.analyze}
+            </button>
+            <button onClick={() => { setText(""); setResult(null); }} className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm border ${dark ? "border-slate-700 text-gray-200" : "border-gray-200 text-gray-600"}`}>
+              <Icon name="clear" size={14} /> {t.clear}
+            </button>
+          </div>
+          {!canWrite && (
+            <p className={`text-xs mt-3 flex items-center gap-1.5 ${dark ? "text-amber-300" : "text-amber-700"}`}>
+              <Icon name="eye" size={12} /> {t.guestWriteNote}
+            </p>
+          )}
+        </Card>
+        <Card dark={dark} className="p-5">
+          <div className={`text-sm font-semibold mb-3 ${dark ? "text-white" : "text-gray-900"}`}>{t.howItWorks}</div>
+          <div className="grid grid-cols-3 gap-3 text-center">
+            {[["analyze", t.step1, t.step1d], ["sparkles", t.step2, t.step2d], ["chart", t.step3, t.step3d]].map(([icon, title, desc], i) => (
+              <div key={i} className={`p-3 rounded-xl ${dark ? "bg-slate-800/60" : "bg-emerald-50/60"}`}>
+                <Icon name={icon} size={18} className="text-emerald-600 mx-auto mb-1.5" />
+                <div className={`text-xs font-medium ${dark ? "text-gray-200" : "text-gray-800"}`}>{title}</div>
+                <div className={`text-[10px] mt-1 ${dark ? "text-gray-500" : "text-gray-500"}`}>{desc}</div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      </div>
+
+      <Card dark={dark} className="p-5 min-h-[260px]">
+        {!result && !loading && <div className={`h-full flex items-center justify-center text-sm ${dark ? "text-gray-500" : "text-gray-400"}`}>{t.analysisResult}</div>}
+        {loading && <div className={`h-full flex items-center justify-center text-sm ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.analyzing}</div>}
+        {result && !loading && !result.error && (
+          <>
+            <div className={`font-semibold mb-3 ${dark ? "text-white" : "text-gray-900"}`}>{t.analysisResult}</div>
+            <div className="flex items-center gap-4 mb-4">
+              <div className="text-4xl">{emoji}</div>
+              <div>
+                <Badge s={result.label} t={t} />
+                <div className={`text-xs mt-1 ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.confidenceScore}: <b>{result.confidence}%</b></div>
+              </div>
+            </div>
+            {["positive", "negative", "neutral"].map((k) => (
+              <div key={k} className="flex items-center gap-2 text-xs mb-1.5">
+                <span className={`w-14 ${dark ? "text-gray-400" : "text-gray-500"}`}>{t[k]}</span>
+                <div className={`flex-1 h-1.5 rounded-full overflow-hidden ${dark ? "bg-slate-800" : "bg-gray-100"}`}>
+                  <div className="h-full rounded-full" style={{ width: `${result.scores[k]}%`, background: COLORS[k] }} />
+                </div>
+                <span className={`w-8 text-right ${dark ? "text-gray-400" : "text-gray-500"}`}>{result.scores[k]}%</span>
+              </div>
+            ))}
+            <div className={`mt-4 pt-4 border-t ${dark ? "border-slate-800" : "border-gray-100"}`}>
+              <div className={`text-sm font-semibold mb-2 ${dark ? "text-white" : "text-gray-900"}`}>{t.keywordsDetected}</div>
+              {result.keywords.length ? (
+                <div className="flex flex-wrap gap-2">
+                  {result.keywords.map((k) => (
+                    <span key={k} className={`px-2.5 py-1 rounded-lg text-xs font-medium ${result.negative_keywords.includes(k) ? "bg-rose-50 text-rose-600" : "bg-emerald-50 text-emerald-700"}`}>{k}</span>
+                  ))}
+                </div>
+              ) : <p className={`text-sm ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.noKeywords}</p>}
+            </div>
+          </>
+        )}
+        {result && result.error && <div className="text-rose-500 text-sm">{t.backendOffline}</div>}
+      </Card>
+    </div>
+  );
+}
+
+/* ============== COMMENTS (v12: real reviews system) ============== */
+// Professional, mobile-responsive reviews page:
+//  * header with the overall average star rating
+//  * write-a-review box (registered users) with a 1..5 star picker
+//  * search + filters: sentiment / stars / source / date range (+ status for the admin)
+//  * review cards: author name, source badge, date & time, stars, sentiment,
+//    Like button, and admin moderation (publish / hide / edit / delete)
+function CommentsPage({ t, dark, online, refreshKey, isAdmin, canWrite, commentsLang }) {
+  const [items, setItems] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [summary, setSummary] = useState(null);
+  const [query, setQuery] = useState("");
+  const [sentFilter, setSentFilter] = useState("all");
+  const [ratingFilter, setRatingFilter] = useState("all");
+  const [sourceFilter, setSourceFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all"); // admin only
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [page, setPage] = useState(1);
+  const perPage = 8;
+  // write-a-review composer
+  const [newText, setNewText] = useState("");
+  const [newRating, setNewRating] = useState(0);
+  const [newCategory, setNewCategory] = useState("General");
+  const [posting, setPosting] = useState(false);
+  // admin inline edit
+  const [editId, setEditId] = useState(null);
+  const [editDraft, setEditDraft] = useState({ text: "", rating: 0 });
+
+  const load = () => {
+    const params = new URLSearchParams({ search: query, sentiment: sentFilter, rating: ratingFilter,
+      source: sourceFilter, page, per_page: perPage });
+    if (isAdmin) params.set("status", statusFilter);
+    if (dateFrom) params.set("date_from", dateFrom);
+    if (dateTo) params.set("date_to", dateTo);
+    apiFetch(`${API}/comments?${params}`).then((r) => r.json())
+      .then((d) => { setItems(d.items || []); setTotal(d.total || 0); })
+      .catch(() => { setItems([]); setTotal(0); });
+    apiFetch(`${API}/comments/summary`).then((r) => r.json()).then(setSummary).catch(() => setSummary(null));
+  };
+  useEffect(load, [query, sentFilter, ratingFilter, sourceFilter, statusFilter, dateFrom, dateTo, page, online, refreshKey]);
+
+  // Auto-translate the displayed comments to the language chosen in Settings.
+  const { map: trMap, busy: translating } = useTranslatedTexts(items, commentsLang);
+
+  const postReview = async () => {
+    if (!newText.trim() || posting) return;
+    setPosting(true);
+    try {
+      const r = await apiFetch(`${API}/comments`, { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: newText, category: newCategory, rating: newRating || null }) });
+      if (r.ok) { setNewText(""); setNewRating(0); setPage(1); load(); }
+    } catch (e) { /* offline */ }
+    setPosting(false);
+  };
+  const toggleLike = (c) => {
+    if (!canWrite) return; // guests can't like — same rule as writing
+    apiFetch(`${API}/comments/${c.id}/like`, { method: "POST" }).then((r) => r.json())
+      .then((d) => setItems((arr) => arr.map((x) => x.id === c.id ? { ...x, likes: d.likes, liked_by_me: d.liked_by_me } : x)))
+      .catch(() => {});
+  };
+  const setStatus = (c, status) =>
+    apiFetch(`${API}/comments/${c.id}/status`, { method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }) }).then(load);
+  const del = (id) => apiFetch(`${API}/comments/${id}`, { method: "DELETE" }).then(load);
+  const startEdit = (c) => { setEditId(c.id); setEditDraft({ text: c.text, rating: c.rating || 0 }); };
+  const saveEdit = async () => {
+    await apiFetch(`${API}/comments/${editId}`, { method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: editDraft.text, rating: editDraft.rating || null }) });
+    setEditId(null); load();
+  };
+  // The export endpoint is admin-only, so the request must carry the auth
+  // token — window.open can't do that, so we download the CSV via fetch+blob.
+  const exportCsv = async () => {
+    try {
+      const r = await apiFetch(`${API}/comments/export?format=csv`);
+      if (!r.ok) return;
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = "comments.csv";
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) { /* offline — button silently does nothing */ }
+  };
+
+  const selCls = `${PILL} w-auto ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`;
+  const fmtDateTime = (iso) => { const d = new Date(iso); return d.toLocaleDateString() + " • " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); };
+
+  return (
+    <div className="p-4 md:p-6 space-y-4">
+      <BackendBanner t={t} online={online} />
+
+      {/* ---- Overall rating header ---- */}
+      {summary && (
+        <Card dark={dark} className="p-4 flex flex-wrap items-center gap-4">
+          <div className="flex items-center gap-3">
+            <div className={`text-3xl font-bold ${dark ? "text-white" : "text-gray-900"}`}>{summary.avg_rating || "—"}</div>
+            <div>
+              <Stars value={Math.round(summary.avg_rating || 0)} size={17} />
+              <div className={`text-[11px] mt-0.5 ${dark ? "text-gray-400" : "text-gray-500"}`}>
+                {t.avgRating} • {summary.rated_count} {t.ratedReviews} • {summary.total_comments} {t.reviews}
+              </div>
+            </div>
+          </div>
+          {isAdmin && (
+            <button onClick={exportCsv} className="ms-auto flex items-center gap-1.5 text-xs px-3 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white"><Icon name="download" size={13} />{t.exportCsv}</button>
+          )}
+        </Card>
+      )}
+
+      {/* ---- Write a review (registered accounts only) ---- */}
+      {canWrite && (
+        <Card dark={dark} className="p-4">
+          <div className={`text-sm font-semibold mb-2 ${dark ? "text-white" : "text-gray-900"}`}>{t.writeReview}</div>
+          <textarea value={newText} onChange={(e) => setNewText(e.target.value)} rows={3} placeholder={t.writeComment}
+            className={`w-full rounded-xl border p-3 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-emerald-500 ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`} />
+          <div className="flex flex-wrap items-center gap-3 mt-2">
+            <span className={`text-xs ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.yourRating}:</span>
+            <Stars value={newRating} onChange={setNewRating} size={20} />
+            <select value={newCategory} onChange={(e) => setNewCategory(e.target.value)} className={selCls}>
+              {CATS.map((c) => <option key={c} value={Object.keys(CAT_LABEL_TO_KEY).find((k) => CAT_LABEL_TO_KEY[k] === c) || c}>{t[c]}</option>)}
+            </select>
+            <button onClick={postReview} disabled={posting || !newText.trim()}
+              className="ms-auto flex items-center gap-1.5 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-40 text-white px-4 py-2 rounded-xl text-sm font-medium">
+              <Icon name="sparkles" size={14} /> {posting ? t.analyzing : t.addComment}
+            </button>
+          </div>
+        </Card>
+      )}
+
+      {/* ---- Search + filters ---- */}
+      <Card dark={dark} className="p-4 flex flex-wrap gap-2 items-center">
+        <input value={query} onChange={(e) => { setQuery(e.target.value); setPage(1); }} placeholder={t.search}
+          className={`${PILL} flex-1 min-w-[180px] ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`} />
+        <select value={sentFilter} onChange={(e) => { setSentFilter(e.target.value); setPage(1); }} className={selCls}>
+          <option value="all">{t.allSentiments}</option><option value="positive">{t.positive}</option><option value="negative">{t.negative}</option><option value="neutral">{t.neutral}</option>
+        </select>
+        <select value={ratingFilter} onChange={(e) => { setRatingFilter(e.target.value); setPage(1); }} className={selCls}>
+          <option value="all">{t.allRatings}</option>
+          {[5, 4, 3, 2, 1].map((n) => <option key={n} value={n}>{"★".repeat(n)} ({n})</option>)}
+        </select>
+        <select value={sourceFilter} onChange={(e) => { setSourceFilter(e.target.value); setPage(1); }} className={selCls}>
+          <option value="all">{t.allSources}</option><option value="user">{t.sourceUser}</option>
+          <option value="youtube">{t.sourceYoutube}</option><option value="reddit">{t.sourceReddit}</option><option value="x">{t.sourceX}</option>
+        </select>
+        {isAdmin && (
+          <select value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value); setPage(1); }} className={selCls}>
+            <option value="all">{t.allStatuses}</option><option value="approved">{t.approvedStatus}</option><option value="hidden">{t.hiddenStatus}</option>
+          </select>
+        )}
+        <label className={`flex items-center gap-1.5 text-[11px] ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.fromDate}
+          <input type="date" value={dateFrom} onChange={(e) => { setDateFrom(e.target.value); setPage(1); }} className={selCls} /></label>
+        <label className={`flex items-center gap-1.5 text-[11px] ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.toDate}
+          <input type="date" value={dateTo} onChange={(e) => { setDateTo(e.target.value); setPage(1); }} className={selCls} /></label>
+        {translating && <span className={`text-xs ${dark ? "text-amber-300" : "text-amber-600"}`}>{t.translating}</span>}
+      </Card>
+
+      {/* ---- Review cards, newest first ---- */}
+      <div className="space-y-3">
+        {items.map((c) => (
+          <Card dark={dark} key={c.id} className={`p-4 ${c.status === "hidden" ? "opacity-60 border border-dashed border-amber-400" : ""}`}>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold ${dark ? "bg-emerald-900/60 text-emerald-300" : "bg-emerald-100 text-emerald-800"}`}>
+                {(c.user_name || "؟").trim().charAt(0).toUpperCase()}
+              </div>
+              <div className="min-w-0">
+                <div className={`text-sm font-semibold truncate ${dark ? "text-gray-100" : "text-gray-800"}`}>{c.user_name || "—"}</div>
+                <div className={`text-[11px] ${dark ? "text-gray-500" : "text-gray-400"}`}>{fmtDateTime(c.created_at)}</div>
+              </div>
+              <div className="flex items-center gap-2 ms-auto">
+                {c.rating ? <Stars value={c.rating} size={14} /> : null}
+                <SourceBadge source={c.source} t={t} dark={dark} />
+                <Badge s={c.sentiment} t={t} />
+                {isAdmin && c.status === "hidden" && <span className="px-2 py-0.5 rounded-full text-[10px] bg-amber-100 text-amber-700">{t.hiddenStatus}</span>}
+              </div>
+            </div>
+            {editId === c.id ? (
+              <div className="mt-3">
+                <textarea value={editDraft.text} onChange={(e) => setEditDraft({ ...editDraft, text: e.target.value })} rows={3}
+                  className={`w-full rounded-xl border p-3 text-sm ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`} />
+                <div className="flex items-center gap-3 mt-2">
+                  <Stars value={editDraft.rating} onChange={(n) => setEditDraft({ ...editDraft, rating: n })} size={17} />
+                  <button onClick={saveEdit} className="text-xs bg-emerald-700 text-white px-3 py-1.5 rounded-lg">{t.saveEdit}</button>
+                  <button onClick={() => setEditId(null)} className={`text-xs px-3 py-1.5 rounded-lg border ${dark ? "border-slate-700 text-gray-300" : "border-gray-200 text-gray-600"}`}>{t.cancel}</button>
+                </div>
+              </div>
+            ) : (
+              <p className={`text-sm mt-2.5 leading-relaxed ${dark ? "text-gray-300" : "text-gray-700"}`}>{trMap[c.id] || c.text}</p>
+            )}
+            <div className="flex flex-wrap items-center gap-2 mt-3">
+              <button onClick={() => toggleLike(c)} disabled={!canWrite}
+                className={`flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border transition
+                  ${c.liked_by_me ? "bg-emerald-700 text-white border-emerald-700" : dark ? "border-slate-700 text-gray-300 hover:bg-slate-800" : "border-gray-200 text-gray-600 hover:bg-gray-50"} ${!canWrite ? "opacity-40 cursor-not-allowed" : ""}`}>
+                👍 {t.like} {c.likes > 0 && <span className="font-semibold">{c.likes}</span>}
+              </button>
+              <span className={`text-[11px] px-2 py-1 rounded-lg ${dark ? "bg-slate-800/70 text-gray-400" : "bg-gray-50 text-gray-500"}`}>{t[CAT_LABEL_TO_KEY[c.category]] || c.category}</span>
+              {isAdmin && (
+                <div className="flex items-center gap-1.5 ms-auto" title={t.moderationHint}>
+                  <button onClick={() => startEdit(c)} className={`text-[11px] px-2.5 py-1.5 rounded-lg ${dark ? "bg-slate-800 text-gray-200" : "bg-gray-100 text-gray-700"}`}>{t.edit}</button>
+                  {c.status === "approved"
+                    ? <button onClick={() => setStatus(c, "hidden")} className="text-[11px] px-2.5 py-1.5 rounded-lg bg-amber-100 text-amber-700">{t.hideAction}</button>
+                    : <button onClick={() => setStatus(c, "approved")} className="text-[11px] px-2.5 py-1.5 rounded-lg bg-emerald-100 text-emerald-700">{t.approve}</button>}
+                  <button onClick={() => del(c.id)} className={`p-1.5 rounded-lg ${dark ? "hover:bg-slate-800 text-rose-400" : "hover:bg-gray-100 text-rose-500"}`}><Icon name="trash" size={14} /></button>
+                </div>
+              )}
+            </div>
+          </Card>
+        ))}
+        {!items.length && (
+          <Card dark={dark} className={`p-10 text-center text-sm ${dark ? "text-gray-500" : "text-gray-400"}`}>{t.noComments}</Card>
+        )}
+      </div>
+
+      {/* ---- Pagination ---- */}
+      <div className={`flex items-center justify-between px-1 text-xs ${dark ? "text-gray-400" : "text-gray-500"}`}>
+        <span>{t.showing} {items.length} {t.of} {total}</span>
+        <div className="flex items-center gap-3">
+          <button disabled={page === 1} onClick={() => setPage((p) => p - 1)} className="disabled:opacity-30 px-2 py-1">‹</button>
+          <span>{page}</span>
+          <button disabled={page * perPage >= total} onClick={() => setPage((p) => p + 1)} className="disabled:opacity-30 px-2 py-1">›</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============== ANALYTICS ============== */
+function AnalyticsPage({ t, dark, online }) {
+  const [stats, setStats] = useState(null);
+  const [ext, setExt] = useState(null); // v12: external sources status
+  const [fetching, setFetching] = useState(false);
+  const loadExt = () => apiFetch(`${API}/admin/external-status`).then((r) => r.json()).then(setExt).catch(() => setExt(null));
+  useEffect(() => {
+    apiFetch(`${API}/dashboard/stats`).then((r) => r.json()).then(setStats).catch(() => setStats(null));
+    loadExt();
+  }, [online]);
+  const fetchNow = async () => {
+    setFetching(true);
+    try { await apiFetch(`${API}/admin/fetch-external`, { method: "POST" }); } catch (e) {}
+    await loadExt();
+    setFetching(false);
+  };
+  if (!stats) return <div className="p-6"><Card dark={dark} className="p-8"><BackendBanner t={t} online={online} /></Card></div>;
+  const catLabels = Object.keys(stats.by_category);
+  const bar = {
+    labels: catLabels.map((c) => t[CAT_LABEL_TO_KEY[c]] || c),
+    datasets: [{ label: t.totalComments, data: catLabels.map((c) => stats.by_category[c].total), backgroundColor: "#059669" }],
+  };
+  return (
+    <div className="p-4 md:p-6 space-y-4">
+      <BackendBanner t={t} online={online} />
+      <Card dark={dark} className="p-4">
+        <div className={`font-semibold mb-2 ${dark ? "text-white" : "text-gray-900"}`}>{t.sentimentByCategory}</div>
+        <ChartCanvas type="bar" data={bar} options={{ maintainAspectRatio: false }} />
+      </Card>
+      <Card dark={dark} className="p-4">
+        <div className={`font-semibold mb-3 ${dark ? "text-white" : "text-gray-900"}`}>{t.topKeywords}</div>
+        <div className="flex flex-wrap gap-2">
+          {stats.top_keywords.map(([w, n]) => (
+            <span key={w} className={`px-3 py-1.5 rounded-full text-xs ${dark ? "bg-slate-800 text-gray-200" : "bg-emerald-50 text-emerald-800"}`} style={{ fontSize: 11 + Math.min(n, 6) * 2 }}>{w}</span>
+          ))}
+        </div>
+      </Card>
+      {/* ---- v12: external sources (official APIs) control panel ---- */}
+      <Card dark={dark} className="p-4">
+        <div className="flex flex-wrap items-center gap-3 mb-3">
+          <div className={`font-semibold ${dark ? "text-white" : "text-gray-900"}`}>{t.externalSources}</div>
+          {ext && <span className={`text-[11px] ${dark ? "text-gray-500" : "text-gray-400"}`}>{t.autoHourly} {ext.interval_minutes} {t.minutes}</span>}
+          <button onClick={fetchNow} disabled={fetching}
+            className="ms-auto text-xs bg-emerald-700 hover:bg-emerald-800 disabled:opacity-40 text-white px-3 py-1.5 rounded-lg">
+            {fetching ? "..." : t.fetchNow}
+          </button>
+        </div>
+        {ext ? (
+          <div className="grid sm:grid-cols-3 gap-3">
+            {["youtube", "reddit", "x"].map((s) => (
+              <div key={s} className={`p-3 rounded-xl ${dark ? "bg-slate-800/60" : "bg-gray-50"}`}>
+                <div className="flex items-center gap-2 mb-1">
+                  <SourceBadge source={s} t={t} dark={dark} />
+                  <span className={`text-[11px] ${ext.configured[s] ? "text-emerald-600" : dark ? "text-gray-500" : "text-gray-400"}`}>
+                    {ext.configured[s] ? t.configuredOn : t.notConfigured}
+                  </span>
+                </div>
+                <div className={`text-lg font-bold ${dark ? "text-white" : "text-gray-900"}`}>{(ext.counts_by_source && ext.counts_by_source[s]) || 0}</div>
+                <div className={`text-[10px] ${dark ? "text-gray-500" : "text-gray-400"}`}>{t.reviews}</div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className={`text-xs ${dark ? "text-gray-500" : "text-gray-400"}`}>—</p>
+        )}
+        {ext && ext.last_run && (
+          <p className={`text-[11px] mt-2 ${dark ? "text-gray-500" : "text-gray-400"}`}>{t.lastRun}: {new Date(ext.last_run).toLocaleString()}</p>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ============== REPORTS ============== */
+function ReportsPage({ t, dark, online, isAdmin }) {
+  const [stats, setStats] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    setLoading(true);
+    setError("");
+    apiFetchJson(`${API}/dashboard/stats`)
+      .then((d) => setStats(d))
+      .catch((e) => { setStats(null); setError(e && e.message ? e.message : "Failed to load report"); })
+      .finally(() => setLoading(false));
+  }, [online]);
+  return (
+    <div className="p-4 md:p-6 space-y-4">
+      <BackendBanner t={t} online={online} />
+      {isAdmin && (
+        <Card dark={dark} className="p-4 flex justify-end">
+          <button onClick={() => window.print()} className="flex items-center gap-1.5 bg-emerald-700 text-white px-4 py-2 rounded-xl text-sm"><Icon name="file" size={14} />{t.print}</button>
+        </Card>
+      )}
+      {loading && (
+        <Card dark={dark} className="p-8 text-center text-sm">
+          <span className={dark ? "text-gray-400" : "text-gray-500"}>{t.analyzing || "Loading…"}</span>
+        </Card>
+      )}
+      {!loading && error && (
+        <Card dark={dark} className="p-6 text-center">
+          <p className="text-rose-600 text-sm mb-3">{error}</p>
+          <button onClick={() => window.location.reload()} className="text-xs bg-rose-600 text-white px-3 py-1.5 rounded-lg">Retry</button>
+        </Card>
+      )}
+      {!loading && !error && stats && (
+        <Card dark={dark} className="p-6">
+          <div className="flex items-center gap-2 mb-1">
+            <MosqueLogo size={22} className="text-emerald-700" />
+            <h2 className={`text-lg font-bold ${dark ? "text-white" : "text-gray-900"}`}>{t.appName} — {t.generateReport}</h2>
+          </div>
+          <p className={`text-xs mb-5 ${dark ? "text-gray-500" : "text-gray-400"}`}>{new Date().toLocaleDateString()}</p>
+          <div className={`font-semibold mb-2 ${dark ? "text-white" : "text-gray-900"}`}>{t.reportSummary}</div>
+          <div className="grid grid-cols-3 gap-3">
+            <div className={`p-3 rounded-xl text-center ${dark ? "bg-slate-800/60" : "bg-emerald-50"}`}><div className="text-xl font-bold text-emerald-600">{stats.positive}</div><div className={`text-xs ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.positive}</div></div>
+            <div className={`p-3 rounded-xl text-center ${dark ? "bg-slate-800/60" : "bg-rose-50"}`}><div className="text-xl font-bold text-rose-600">{stats.negative}</div><div className={`text-xs ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.negative}</div></div>
+            <div className={`p-3 rounded-xl text-center ${dark ? "bg-slate-800/60" : "bg-gray-100"}`}><div className="text-xl font-bold text-gray-600">{stats.neutral}</div><div className={`text-xs ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.neutral}</div></div>
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/* ============== USERS ============== */
+function UsersPage({ t, dark, online }) {
+  const [users, setUsers] = useState([]);
+  const [editingId, setEditingId] = useState(null);
+  const [draft, setDraft] = useState({ name: "", email: "", role: "user" });
+  const [adding, setAdding] = useState(false);
+  const [newUser, setNewUser] = useState({ name: "", email: "", role: "user", password: "" });
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+
+  const load = () => {
+    setLoading(true);
+    setLoadError("");
+    return apiFetchJson(`${API}/users`)
+      .then(setUsers)
+      .catch((e) => { setUsers([]); setLoadError(e && e.message ? e.message : "Failed to load users"); })
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { load(); }, [online]);
+
+  const startEdit = (u) => { setEditingId(u.id); setDraft({ name: u.name, email: u.email, role: u.role }); };
+  const saveEdit = async (id) => {
+    await apiFetch(`${API}/users/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(draft) });
+    setEditingId(null);
+    load();
+  };
+  const cancelEdit = () => setEditingId(null);
+  const del = (id) => apiFetch(`${API}/users/${id}`, { method: "DELETE" }).then(load);
+
+  const addUser = async () => {
+    setError("");
+    if (!newUser.name.trim() || !newUser.email.trim()) return;
+    const r = await apiFetch(`${API}/users`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(newUser) });
+    const data = await r.json();
+    if (!r.ok) { setError(data.error || "Error"); return; }
+    setNewUser({ name: "", email: "", role: "user", password: "" });
+    setAdding(false);
+    load();
+  };
+
+  const inputCls = `px-2 py-1.5 rounded-lg text-sm border w-full ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`;
+  // The admin role is never offered — it belongs to the fixed admin email only.
+  const roleSelect = (value, onChange) => (
+    <select value={value} onChange={(e) => onChange(e.target.value)} className={inputCls}>
+      <option value="user">{t.user}</option>
+      <option value="guest">{t.guest}</option>
+    </select>
+  );
+  const isFixedAdmin = (u) => !!u.fixed || u.role === "admin"; // flagged by the backend — no email hardcoded in the UI
+
+  return (
+    <div className="p-4 md:p-6 space-y-4">
+      <BackendBanner t={t} online={online} />
+      <Card dark={dark} className="p-4 flex justify-between items-center">
+        <div className={`font-semibold ${dark ? "text-white" : "text-gray-900"}`}>{t.users}</div>
+        {!adding && (
+          <button onClick={() => setAdding(true)} className="flex items-center gap-1.5 bg-emerald-700 text-white px-3 py-2 rounded-xl text-sm">
+            <Icon name="users" size={14} />{t.addUser}
+          </button>
+        )}
+      </Card>
+
+      {adding && (
+        <Card dark={dark} className="p-4">
+          {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+          <div className="grid sm:grid-cols-4 gap-2 mb-3">
+            <input placeholder={t.name} value={newUser.name} onChange={(e) => setNewUser({ ...newUser, name: e.target.value })} className={inputCls} />
+            <input placeholder={t.email} value={newUser.email} onChange={(e) => setNewUser({ ...newUser, email: e.target.value })} className={inputCls} />
+            <input placeholder={t.password} type="password" value={newUser.password} onChange={(e) => setNewUser({ ...newUser, password: e.target.value })} className={inputCls} />
+            {roleSelect(newUser.role, (v) => setNewUser({ ...newUser, role: v }))}
+          </div>
+          <div className="flex gap-2">
+            <button onClick={addUser} className="bg-emerald-700 text-white px-4 py-2 rounded-xl text-xs font-medium">{t.save}</button>
+            <button onClick={() => setAdding(false)} className={`px-4 py-2 rounded-xl text-xs border ${dark ? "border-slate-700 text-gray-200" : "border-gray-200 text-gray-600"}`}>{t.cancel}</button>
+          </div>
+        </Card>
+      )}
+
+      {loading && (
+        <Card dark={dark} className="p-8 text-center text-sm">
+          <span className={dark ? "text-gray-400" : "text-gray-500"}>{t.analyzing || "Loading…"}</span>
+        </Card>
+      )}
+      {!loading && loadError && (
+        <Card dark={dark} className="p-6 text-center">
+          <p className="text-rose-600 text-sm mb-3">{loadError}</p>
+          <button onClick={load} className="text-xs bg-rose-600 text-white px-3 py-1.5 rounded-lg">Retry</button>
+        </Card>
+      )}
+      {!loading && !loadError && (
+      <Card dark={dark} className="overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className={dark ? "bg-slate-800/60" : "bg-gray-50"}>
+            <tr className={dark ? "text-gray-400" : "text-gray-500"}>{[t.name, t.email, t.role, t.actions].map((h) => <th key={h} className="text-start px-4 py-3 font-medium">{h}</th>)}</tr>
+          </thead>
+          <tbody>
+            {users.map((u) => {
+              const isEditing = editingId === u.id;
+              const fixedAdmin = isFixedAdmin(u);
+              return (
+                <tr key={u.id} className={`border-t ${dark ? "border-slate-800" : "border-gray-100"}`}>
+                  <td className="px-4 py-3">
+                    {isEditing ? <input value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} className={inputCls} />
+                      : <span className={dark ? "text-gray-200" : "text-gray-800"}>{u.name}</span>}
+                  </td>
+                  <td className="px-4 py-3">
+                    {isEditing ? <input value={draft.email} onChange={(e) => setDraft({ ...draft, email: e.target.value })} className={inputCls} />
+                      : <span className={dark ? "text-gray-400" : "text-gray-500"}>{u.email}</span>}
+                  </td>
+                  <td className="px-4 py-3">
+                    {isEditing && !fixedAdmin ? roleSelect(draft.role, (v) => setDraft({ ...draft, role: v }))
+                      : (
+                        <span className="inline-flex items-center gap-1.5">
+                          <span className={`px-2 py-1 rounded-full text-xs ${dark ? "bg-slate-800 text-emerald-300" : "bg-emerald-50 text-emerald-700"}`}>{t[u.role] || u.role}</span>
+                          {fixedAdmin && <span title={t.protectedAccount} className={`px-2 py-1 rounded-full text-[10px] ${dark ? "bg-amber-900/40 text-amber-300" : "bg-amber-50 text-amber-700"}`}>🔒</span>}
+                        </span>
+                      )}
+                  </td>
+                  <td className="px-4 py-3">
+                    {isEditing ? (
+                      <div className="flex gap-1.5">
+                        <button onClick={() => saveEdit(u.id)} className="p-1.5 rounded-lg text-emerald-600 hover:bg-emerald-50"><Icon name="check" size={14} /></button>
+                        <button onClick={cancelEdit} className={`p-1.5 rounded-lg ${dark ? "hover:bg-slate-800 text-gray-400" : "hover:bg-gray-100 text-gray-500"}`}><Icon name="x" size={14} /></button>
+                      </div>
+                    ) : (
+                      <div className="flex gap-1.5">
+                        <button onClick={() => startEdit(u)} className={`p-1.5 rounded-lg ${dark ? "hover:bg-slate-800 text-gray-400" : "hover:bg-gray-100 text-gray-500"}`}><Icon name="edit" size={14} /></button>
+                        {!fixedAdmin && <button onClick={() => del(u.id)} className={`p-1.5 rounded-lg ${dark ? "hover:bg-slate-800 text-rose-400" : "hover:bg-gray-100 text-rose-500"}`}><Icon name="trash" size={14} /></button>}
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+            {!users.length && <tr><td colSpan={4} className={`text-center py-8 text-sm ${dark ? "text-gray-500" : "text-gray-400"}`}>—</td></tr>}
+          </tbody>
+        </table>
+      </Card>
+      )}
+    </div>
+  );
+}
+
+/* ============== LOGIN LOGS (admin-only) ============== */
+function LoginLogsPage({ t, dark, online }) {
+  const [items, setItems] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState("date_desc");
+  const [page, setPage] = useState(1);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const perPage = 15;
+
+  const load = () => {
+    setLoading(true);
+    setLoadError("");
+    const params = new URLSearchParams({ search: query, sort, page, per_page: perPage });
+    apiFetchJson(`${API}/login-logs?${params}`)
+      .then((d) => { setItems(d.items || []); setTotal(d.total || 0); })
+      .catch((e) => { setItems([]); setTotal(0); setLoadError(e && e.message ? e.message : "Failed to load logs"); })
+      .finally(() => setLoading(false));
+  };
+  useEffect(load, [query, sort, page, online]);
+
+  const statusBadge = (s) => (
+    <span className={`px-2.5 py-1 rounded-full text-xs font-medium ${s === "success" ? "bg-emerald-100 text-emerald-700" : "bg-rose-100 text-rose-700"}`}>
+      {s === "success" ? t.success : t.failed}
+    </span>
+  );
+
+  return (
+    <div className="p-4 md:p-6 space-y-4">
+      <BackendBanner t={t} online={online} />
+      <Card dark={dark} className="p-4 flex flex-wrap gap-2 items-center">
+        <input value={query} onChange={(e) => { setQuery(e.target.value); setPage(1); }} placeholder={t.searchLogs}
+          className={`${PILL} flex-1 min-w-[200px] ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`} />
+        <select value={sort} onChange={(e) => { setSort(e.target.value); setPage(1); }}
+          className={`${PILL} w-auto ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`}>
+          <option value="date_desc">{t.newestFirst}</option>
+          <option value="date_asc">{t.oldestFirst}</option>
+          <option value="name">{t.name}</option>
+          <option value="email">{t.email}</option>
+          <option value="status">{t.status}</option>
+        </select>
+      </Card>
+      {loading && (
+        <Card dark={dark} className="p-8 text-center text-sm">
+          <span className={dark ? "text-gray-400" : "text-gray-500"}>{t.loading}</span>
+        </Card>
+      )}
+      {!loading && loadError && (
+        <Card dark={dark} className="p-6 text-center">
+          <p className="text-rose-600 text-sm mb-3">{loadError}</p>
+          <button onClick={load} className="text-xs bg-rose-600 text-white px-3 py-1.5 rounded-lg">Retry</button>
+        </Card>
+      )}
+      {!loading && !loadError && (
+      <Card dark={dark} className="overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className={dark ? "bg-slate-800/60" : "bg-gray-50"}>
+              <tr className={dark ? "text-gray-400" : "text-gray-500"}>
+                {["#", t.name, t.email, t.date, t.time, t.status].map((h) => (
+                  <th key={h} className="text-start px-4 py-3 font-medium whitespace-nowrap">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((l) => {
+                const d = new Date(l.created_at);
+                return (
+                  <tr key={l.id} className={`border-t ${dark ? "border-slate-800" : "border-gray-100"}`}>
+                    <td className={`px-4 py-3 ${dark ? "text-gray-400" : "text-gray-500"}`}>#{l.id}</td>
+                    <td className={`px-4 py-3 ${dark ? "text-gray-200" : "text-gray-800"}`}>{l.name || "—"}</td>
+                    <td className={`px-4 py-3 ${dark ? "text-gray-400" : "text-gray-500"}`}>{l.email}</td>
+                    <td className={`px-4 py-3 whitespace-nowrap ${dark ? "text-gray-400" : "text-gray-500"}`}>{d.toLocaleDateString()}</td>
+                    <td className={`px-4 py-3 whitespace-nowrap ${dark ? "text-gray-400" : "text-gray-500"}`}>{d.toLocaleTimeString()}</td>
+                    <td className="px-4 py-3">{statusBadge(l.status)}</td>
+                  </tr>
+                );
+              })}
+              {!items.length && <tr><td colSpan={6} className={`text-center py-8 text-sm ${dark ? "text-gray-500" : "text-gray-400"}`}>—</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        <div className={`flex items-center justify-between px-4 py-3 border-t text-xs ${dark ? "border-slate-800 text-gray-400" : "border-gray-100 text-gray-500"}`}>
+          <span>{t.showing} {items.length} {t.of} {total}</span>
+          <div className="flex items-center gap-2">
+            <button disabled={page === 1} onClick={() => setPage((p) => p - 1)} className="disabled:opacity-30">‹</button>
+            <span>{page}</span>
+            <button disabled={page * perPage >= total} onClick={() => setPage((p) => p + 1)} className="disabled:opacity-30">›</button>
+          </div>
+        </div>
+      </Card>
+      )}
+    </div>
+  );
+}
+
+/* ============== PROFILE ============== */
+function ProfilePage({ t, dark, user }) {
+  const safeUser = user && typeof user === "object" ? user : {};
+  const safeName = typeof safeUser.name === "string" && safeUser.name.length > 0 ? safeUser.name : "?";
+  const safeEmail = typeof safeUser.email === "string" ? safeUser.email : "";
+  const safeRole = typeof safeUser.role === "string" ? safeUser.role : "";
+  const roleLabel = (t && t[safeRole]) ? t[safeRole] : safeRole;
+  return (
+    <div className="p-4 md:p-6 max-w-md">
+      <Card dark={dark} className="p-6 text-center">
+        <div className={`w-20 h-20 rounded-full mx-auto flex items-center justify-center text-2xl font-bold mb-3 ${dark ? "bg-emerald-800 text-emerald-100" : "bg-emerald-100 text-emerald-800"}`}>
+          {safeName.charAt(0).toUpperCase()}
+        </div>
+        <input defaultValue={safeName === "?" ? "" : safeName} className={`${PILL} mb-2 text-center font-semibold ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`} />
+        <input defaultValue={safeEmail} className={`${PILL} mb-2 text-center ${dark ? "bg-slate-800 border-slate-700 text-white" : "border-gray-200"}`} />
+        <div className={`text-xs mb-4 ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.role}: {roleLabel}</div>
+        <button className="w-full bg-emerald-700 text-white rounded-xl py-2.5 font-medium">{t.save}</button>
+      </Card>
+    </div>
+  );
+}
+
+/* ============== SETTINGS ============== */
+function SettingsPage({ t, dark, setDark, lang, setLang, online, isGuest, commentsLang, setCommentsLang }) {
+  const langBtn = (value, label) => (
+    <button onClick={() => setCommentsLang(value)}
+      className={`px-3 py-1.5 rounded-lg text-xs ${commentsLang === value ? "bg-emerald-700 text-white" : "bg-gray-100 text-gray-600"}`}>
+      {label}
+    </button>
+  );
+  return (
+    <div className="p-4 md:p-6 max-w-md">
+      <BackendBanner t={t} online={online} />
+      <Card dark={dark} className="p-5">
+        <div className="flex items-center justify-between py-2.5">
+          <span className={`text-sm ${dark ? "text-gray-300" : "text-gray-700"}`}>{t.theme}</span>
+          <div className="flex gap-2">
+            <button onClick={() => setDark(false)} className={`px-3 py-1.5 rounded-lg text-xs ${!dark ? "bg-emerald-700 text-white" : "bg-gray-100 text-gray-600"}`}>{t.light}</button>
+            <button onClick={() => setDark(true)} className={`px-3 py-1.5 rounded-lg text-xs ${dark ? "bg-emerald-700 text-white" : "bg-gray-100 text-gray-600"}`}>{t.dark}</button>
+          </div>
+        </div>
+        <div className="flex items-center justify-between py-2.5">
+          <span className={`text-sm ${dark ? "text-gray-300" : "text-gray-700"}`}>{t.language}</span>
+          <div className="flex gap-2">
+            <button onClick={() => setLang("ar")} className={`px-3 py-1.5 rounded-lg text-xs ${lang === "ar" ? "bg-emerald-700 text-white" : "bg-gray-100 text-gray-600"}`}>عربي</button>
+            <button onClick={() => setLang("en")} className={`px-3 py-1.5 rounded-lg text-xs ${lang === "en" ? "bg-emerald-700 text-white" : "bg-gray-100 text-gray-600"}`}>English</button>
+          </div>
+        </div>
+        {/* Comments Language (v11) — for EVERY signed-in account (admin AND
+            regular users; guests have no account to save the choice on).
+            Personal per account: saved on the user's own row in the database,
+            so it never affects other users and is restored on every login. */}
+        {!isGuest && (
+          <div className={`py-2.5 border-t mt-1 ${dark ? "border-slate-800" : "border-gray-100"}`}>
+            <div className="flex items-center justify-between">
+              <span className={`text-sm ${dark ? "text-gray-300" : "text-gray-700"}`}>{t.commentsLanguage}</span>
+              <div className="flex gap-2">
+                {langBtn("original", t.originalLang)}
+                {langBtn("ar", "عربي")}
+                {langBtn("en", "English")}
+              </div>
+            </div>
+            <p className={`text-xs mt-2 ${dark ? "text-gray-500" : "text-gray-400"}`}>{t.commentsLanguageSub}</p>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ============== ERROR BOUNDARY (shows real errors instead of a blank page) ============== */
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) { console.error("Page crashed:", error, info); }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="p-6" style={{ maxWidth: "100%", overflowX: "hidden" }}>
+          <div className="rounded-2xl border border-rose-200 bg-rose-50 p-5 text-rose-700">
+            <div className="font-bold mb-1">This page hit an error</div>
+            <pre className="text-xs whitespace-pre-wrap" style={{ overflowWrap: "break-word", wordBreak: "break-word", maxWidth: "100%" }}>{String(this.state.error && this.state.error.message || this.state.error)}</pre>
+            <button onClick={() => this.setState({ error: null })} className="mt-3 text-xs bg-rose-600 text-white px-3 py-1.5 rounded-lg">
+              Try again
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+/* ============== ACCESS DENIED (admin panel protection) ============== */
+function AccessDenied({ t, dark }) {
+  return (
+    <div className="p-6 max-w-md mx-auto">
+      <div className={`rounded-2xl border p-8 text-center ${dark ? "bg-slate-900 border-slate-800" : "bg-white border-gray-100"}`}>
+        <div className={`w-14 h-14 rounded-full mx-auto mb-4 flex items-center justify-center ${dark ? "bg-rose-900/30" : "bg-rose-50"}`}>
+          <Icon name="x" size={22} className="text-rose-500" />
+        </div>
+        <div className={`font-bold mb-1 ${dark ? "text-white" : "text-gray-900"}`}>{t.adminOnly}</div>
+        <p className={`text-sm ${dark ? "text-gray-400" : "text-gray-500"}`}>{t.adminOnlySub}</p>
+      </div>
+    </div>
+  );
+}
+
+/* ============== APP ROOT ============== */
+function App() {
+  // Restore a remembered login (saved on the last successful sign-in).
+  const [user, setUser] = useState(() => {
+    const s = loadSession();
+    if (s) { window.__authToken = s.token; return s.user; }
+    return null;
+  });
+  const [lang, setLang] = useState("ar");
+  const [dark, setDark] = useState(false);
+  // Display language for COMMENTS (v11) — a PERSONAL setting of each
+  // signed-in account (admin and regular users alike). The chosen value is
+  // saved on the account's own row in the database via PUT /api/me/comment-lang,
+  // so it survives logout/login, restarts and redeploys, follows the account
+  // on any device, and one user's choice never affects anyone else.
+  // localStorage only mirrors it as an offline fallback for the same browser.
+  const [commentsLang, setCommentsLangState] = useState(() => {
+    const s = loadSession();
+    if (s && s.user && s.user.comment_lang) return s.user.comment_lang;
+    try { return localStorage.getItem(COMMENTS_LANG_KEY) || "original"; } catch (e) { return "original"; }
+  });
+  const setCommentsLang = (v) => {
+    setCommentsLangState(v);
+    try { localStorage.setItem(COMMENTS_LANG_KEY, v); } catch (e) {}
+    // Persist on the account itself (guests have no account -> nothing to save).
+    if (user && !user.guest && user.role !== "guest" && window.__authToken) {
+      apiFetch(`${API}/me/comment-lang`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ comment_lang: v }),
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((u) => {
+          if (u && u.comment_lang) {
+            const nu = Object.assign({}, user, { comment_lang: u.comment_lang });
+            setUser(nu);
+            saveSession(nu, window.__authToken); // remembered session keeps the choice too
+          }
+        })
+        .catch(() => {}); // offline: the local value still applies; synced next time it's changed
+    }
+  };
+  const [page, setPage] = useState("dashboard");
+  const [open, setOpen] = useState(false);
+  const [online, setOnline] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const t = T[lang];
+
+  useEffect(() => { document.documentElement.dir = lang === "ar" ? "rtl" : "ltr"; document.body.style.fontFamily = lang === "ar" ? "'Tajawal',sans-serif" : "'Inter',sans-serif"; }, [lang]);
+  useEffect(() => {
+    const check = () => apiFetch(`${API}/health`).then((r) => r.ok && setOnline(true)).catch(() => setOnline(false));
+    check();
+    const iv = setInterval(check, 20000);
+    return () => clearInterval(iv);
+  }, []);
+
+  if (!user) return <Login t={t} lang={lang} setLang={setLang} dark={dark} setDark={setDark}
+    onLogin={(u) => {
+      setUser(u); setPage("dashboard");
+      // v11: restore this account's saved comments language (guests -> original)
+      setCommentsLangState((u && u.comment_lang) || "original");
+    }} />;
+
+  const isAdmin = user.role === "admin";
+  const isGuest = !!user.guest || user.role === "guest";
+  const canWrite = !isGuest; // registered users and the admin can add comments
+  const pages = {
+    dashboard: <Dashboard t={t} dark={dark} online={online} lang={lang} commentsLang={isGuest ? "original" : commentsLang} key={refreshKey} />,
+    analyzeComment: <AnalyzeComment t={t} dark={dark} online={online} canWrite={canWrite} onAnalyzed={() => setRefreshKey((k) => k + 1)} />,
+    comments: <CommentsPage t={t} dark={dark} online={online} refreshKey={refreshKey} isAdmin={isAdmin} canWrite={canWrite} commentsLang={isGuest ? "original" : commentsLang} />,
+    // Analytics + Login Logs + Users are admin-only: any non-admin who reaches
+    // them (e.g. programmatically) gets the Access Denied screen instead.
+    analytics: isAdmin ? <AnalyticsPage t={t} dark={dark} online={online} /> : <AccessDenied t={t} dark={dark} />,
+    reports: <ReportsPage t={t} dark={dark} online={online} isAdmin={isAdmin} />,
+    loginLogs: isAdmin ? <LoginLogsPage t={t} dark={dark} online={online} /> : <AccessDenied t={t} dark={dark} />,
+    users: isAdmin ? <UsersPage t={t} dark={dark} online={online} /> : <AccessDenied t={t} dark={dark} />,
+    profile: <ProfilePage t={t} dark={dark} user={user} />,
+    settings: <SettingsPage t={t} dark={dark} setDark={setDark} lang={lang} setLang={setLang} online={online}
+      isGuest={isGuest} commentsLang={commentsLang} setCommentsLang={setCommentsLang} />,
+  };
+
+  return (
+    <div className={`min-h-screen flex ${dark ? "bg-slate-950" : "bg-gray-50"}`}>
+      <Sidebar t={t} page={page} setPage={setPage} dark={dark} lang={lang} open={open} setOpen={setOpen} isAdmin={isAdmin}
+        onLogout={() => { window.__authToken = null; clearSession(); setUser(null); setPage("dashboard"); setCommentsLangState("original"); }} />
+      {open && <div className="fixed inset-0 bg-black/40 z-30 md:hidden" onClick={() => setOpen(false)} />}
+      <div className="flex-1 min-w-0">
+        <Topbar t={t} lang={lang} setLang={setLang} dark={dark} setDark={setDark} title={t[page]} setOpen={setOpen} user={user} />
+        {isGuest && (
+          <div className={`mx-4 md:mx-6 mt-4 px-4 py-2.5 rounded-xl text-xs flex items-center gap-2 ${dark ? "bg-amber-900/25 text-amber-300 border border-amber-800/40" : "bg-amber-50 text-amber-700 border border-amber-200"}`}>
+            <Icon name="eye" size={13} /> {t.guestBanner}
+          </div>
+        )}
+        <ErrorBoundary key={page}>{pages[page]}</ErrorBoundary>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <ErrorBoundary><App /></ErrorBoundary>
+);
+window.__appMounted = true;
+</script>
+</body>
+</html>

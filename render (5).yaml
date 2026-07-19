@@ -1,0 +1,43 @@
+services:
+- type: web
+  name: hajj-umrah-system
+  env: python
+  buildCommand: pip install -r requirements.txt
+  startCommand: gunicorn app:app
+  # ---------------------------------------------------------------
+  # PERMANENT STORAGE — external PostgreSQL (NO Persistent Disk needed)
+  #
+  # All data (user accounts, the admin account, comments, login logs)
+  # is stored in an EXTERNAL PostgreSQL database referenced by the
+  # DATABASE_URL environment variable. Because the database lives
+  # outside this service's filesystem, NOTHING is lost when the app
+  # is closed, restarted, or redeployed on Render's FREE plan.
+  #
+  # Setup (one time):
+  #   1) Create a free PostgreSQL database. RECOMMENDED: Neon
+  #      (https://neon.tech) — free and does NOT expire.
+  #      (Render's own free PostgreSQL is DELETED after 30 days,
+  #       so do not use it for permanent data.)
+  #   2) Copy its connection string, e.g.
+  #      postgresql://user:pass@host/dbname?sslmode=require
+  #   3) In the Render dashboard -> your service -> Environment ->
+  #      add DATABASE_URL with that value (sync: false below means
+  #      the value is set in the dashboard, not in this file).
+  #
+  # Without DATABASE_URL the app falls back to a local SQLite file —
+  # for local development only (wiped on redeploy on the free plan).
+  # ---------------------------------------------------------------
+  envVars:
+  - key: DATABASE_URL
+    sync: false
+  #
+  # ---- v12: OPTIONAL external comments (official APIs only) ----
+  # Add any of these in the Render dashboard to enable fetching public
+  # comments about Hajj & Umrah (auto-refreshed hourly, de-duplicated,
+  # source shown on every comment). All are optional — without them the
+  # site works normally with user reviews only.
+  #   YOUTUBE_API_KEY        (YouTube Data API v3 key)
+  #   REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET / REDDIT_USER_AGENT
+  #   X_BEARER_TOKEN         (X API v2 — requires recent-search access)
+  #   FETCH_INTERVAL_MINUTES (default 60)
+  #   AUTO_FETCH_EXTERNAL    ("0" disables the hourly refresh)
